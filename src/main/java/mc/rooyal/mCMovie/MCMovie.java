@@ -5,6 +5,9 @@ import de.maxhenkel.voicechat.api.VoicechatServerApi;
 import mc.rooyal.mCMovie.command.MCMovieCommand;
 import mc.rooyal.mCMovie.listener.ScreenCreationListener;
 import mc.rooyal.mCMovie.listener.ScreenProtectionListener;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerMapData;
+import mc.rooyal.mCMovie.screen.MCMovieMapRenderer;
 import mc.rooyal.mCMovie.screen.Screen;
 import mc.rooyal.mCMovie.screen.ScreenManager;
 import mc.rooyal.mCMovie.video.MinecraftMapPalette;
@@ -12,7 +15,6 @@ import mc.rooyal.mCMovie.video.VideoPlayer;
 import mc.rooyal.mCMovie.voicechat.MCMovieVoicechatPlugin;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
-import org.bukkit.map.MapView;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
@@ -96,34 +98,67 @@ public final class MCMovie extends JavaPlugin {
         // Load saved screens
         screenManager.loadScreens(screensFile);
 
-        // Every tick: advance the frame queue by one frame, then send updated maps to players.
+        // Every tick (async): advance the frame queue, compute dirty regions, and push
+        // map packets to nearby players entirely off the main thread.
         //
-        // Performance notes:
-        //  - advanceFrame() is called once per screen (not per player).
-        //  - MapViews are cached in Screen — no Bukkit.getMap() in the hot loop.
-        //  - Nearby players are cached and refreshed every 5 ticks (see Screen).
-        //  - render() skips the setPixel loop for the 2nd+ player per tile per tick
-        //    (the canvas buffer is already correct after the first player renders it).
-        Bukkit.getScheduler().runTaskTimer(this, () -> {
+        // Why this is safe:
+        //  - PacketEvents writes directly to Netty channels — async-safe by design.
+        //  - frameQueue is a LinkedBlockingQueue — thread-safe.
+        //  - renderer fields use volatile for cross-thread visibility.
+        //  - Player list is built by filtering Bukkit.getOnlinePlayers() with cached
+        //    location math — no Bukkit world scan required, safe from async threads.
+        //  - ConcurrentHashMap in ScreenManager allows safe async iteration.
+        //  - Per-screen AtomicBoolean guard ensures only one tick runs at a time,
+        //    preventing overlap if a frame takes longer than 50 ms to send.
+        //  - render() remains registered so Bukkit can still send the full canvas to
+        //    players who load the map mid-playback (separate lastRenderedBytes path).
+        Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
             for (Screen screen : screenManager.getAllScreens().values()) {
                 if (!screen.isPlaying()) continue;
+                if (!screen.tryStartAsyncFrame()) continue; // skip if previous tick still running
 
-                VideoPlayer vp = screen.getVideoPlayer();
+                try {
+                    VideoPlayer vp = screen.getVideoPlayer();
 
-                // advanceFrame() returns true only when a new frame was actually consumed.
-                // During pre-roll, HLS segment gaps, or queue stalls it returns false —
-                // we skip sendMap() entirely so zero packets are sent with stale data.
-                boolean newFrame = (vp != null) && vp.advanceFrame();
-                if (!newFrame) continue;
+                    // advanceFrame() returns true only when a new frame was actually consumed.
+                    // During pre-roll, HLS segment gaps, or queue stalls it returns false —
+                    // no packets are sent with stale data.
+                    if (vp == null || !vp.advanceFrame()) continue;
 
-                List<Player> players = screen.getCachedNearbyPlayers(80);
-                if (players.isEmpty()) continue;
+                    List<Player> players = screen.getNearbyPlayersAsync(80);
+                    if (players.isEmpty()) continue;
 
-                MapView[] mapViews = screen.getMapViews();
-                for (Player player : players) {
-                    for (MapView mapView : mapViews) {
-                        if (mapView != null) player.sendMap(mapView);
+                    int[] mapIds = screen.getMapIds();
+                    List<MCMovieMapRenderer> renderers = screen.getRenderers();
+                    int tileCount = Math.min(mapIds.length, renderers.size());
+
+                    // Build one packet per dirty tile. computeAndMarkPatch() returns only the
+                    // changed bounding box, so unchanged tiles (letters, borders) produce null.
+                    // WrapperPlayServerMapData fields: mapId, scale, trackingPosition, locked,
+                    //   decorations, columns (width), rows (height), x (startX), z (startY), data.
+                    WrapperPlayServerMapData[] packets = new WrapperPlayServerMapData[tileCount];
+                    boolean anyDirty = false;
+                    for (int i = 0; i < tileCount; i++) {
+                        MCMovieMapRenderer.Patch patch = renderers.get(i).computeAndMarkPatch();
+                        if (patch == null) continue;
+                        packets[i] = new WrapperPlayServerMapData(
+                                mapIds[i], (byte) 0, false, false,
+                                java.util.Collections.emptyList(),
+                                patch.width, patch.height, patch.x, patch.y, patch.data);
+                        anyDirty = true;
                     }
+                    if (!anyDirty) continue;
+
+                    var pm = PacketEvents.getAPI().getPlayerManager();
+                    for (Player player : players) {
+                        for (int i = 0; i < tileCount; i++) {
+                            if (packets[i] != null) {
+                                pm.sendPacket(player, packets[i]);
+                            }
+                        }
+                    }
+                } finally {
+                    screen.finishAsyncFrame();
                 }
             }
         }, 1L, 1L);

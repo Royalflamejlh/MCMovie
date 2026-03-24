@@ -2,6 +2,7 @@ name: MCMovie
 version: '0.0.2'
 main: mc.rooyal.mCMovie.MCMovie
 api-version: '1.21'
+depend: [packetevents]
 softdepend: [voicechat]
 commands:
   mcmovie:

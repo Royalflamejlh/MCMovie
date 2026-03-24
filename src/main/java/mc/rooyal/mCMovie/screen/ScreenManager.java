@@ -15,12 +15,13 @@ import org.bukkit.Rotation;
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 
 public class ScreenManager {
 
     private final MCMovie plugin;
-    private final Map<String, Screen> screens = new HashMap<>();
+    private final Map<String, Screen> screens = new ConcurrentHashMap<>();
 
     public ScreenManager(MCMovie plugin) {
         this.plugin = plugin;

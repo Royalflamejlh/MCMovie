@@ -9,9 +9,9 @@ import org.bukkit.entity.Player;
 import org.bukkit.map.MapView;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Screen {
 
@@ -29,15 +29,14 @@ public class Screen {
     // MapView objects for each tile, resolved once (they never change after creation).
     private final MapView[] mapViews;
 
-    // Cached list of nearby players — refreshed every playerCacheInterval ticks
-    // so we don't do a world entity scan on every single tick.
-    private List<Player> cachedPlayers = Collections.emptyList();
-    private int ticksSincePlayerRefresh = 0;
-    private static final int PLAYER_CACHE_INTERVAL = 5; // refresh every 5 ticks (0.25 s)
+    // Guards the async scheduler so only one tick's work runs at a time per screen.
+    // Prevents overlapping executions if packet sending takes longer than one tick.
+    private final AtomicBoolean asyncBusy = new AtomicBoolean(false);
 
-    private VideoPlayer videoPlayer;
+    // volatile: read by the async scheduler thread, written by main-thread commands.
+    private volatile VideoPlayer videoPlayer;
     private String currentUrl;
-    private boolean playing;
+    private volatile boolean playing;
 
     public Screen(String id, World world, BlockFace face, int widthMaps, int heightMaps,
                   Location center, List<UUID> itemFrameUuids, int[] mapIds,
@@ -62,16 +61,30 @@ public class Screen {
     }
 
     /**
-     * Returns the cached nearby-player list, refreshing it every
-     * {@link #PLAYER_CACHE_INTERVAL} ticks. Must be called on the main thread.
+     * Returns nearby players by filtering all online players by world and squared distance.
+     * Safe to call from async threads — no Bukkit world scan, just cached location reads.
      */
-    public List<Player> getCachedNearbyPlayers(double range) {
-        if (ticksSincePlayerRefresh++ >= PLAYER_CACHE_INTERVAL) {
-            cachedPlayers = new ArrayList<>(
-                    world.getNearbyEntitiesByType(Player.class, center, range));
-            ticksSincePlayerRefresh = 0;
+    public List<Player> getNearbyPlayersAsync(double range) {
+        double rangeSq = range * range;
+        double cx = center.getX(), cy = center.getY(), cz = center.getZ();
+        List<Player> result = new ArrayList<>();
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            Location loc = p.getLocation();
+            if (!world.equals(loc.getWorld())) continue;
+            double dx = loc.getX() - cx, dy = loc.getY() - cy, dz = loc.getZ() - cz;
+            if (dx * dx + dy * dy + dz * dz <= rangeSq) result.add(p);
         }
-        return cachedPlayers;
+        return result;
+    }
+
+    /** Acquires the async-frame lock. Returns false if a frame is already in progress. */
+    public boolean tryStartAsyncFrame() {
+        return asyncBusy.compareAndSet(false, true);
+    }
+
+    /** Releases the async-frame lock. */
+    public void finishAsyncFrame() {
+        asyncBusy.set(false);
     }
 
     // Getters

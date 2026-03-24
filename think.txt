@@ -1,0 +1,107 @@
+● Bandwidth math
+
+  Screen: 16×9 tiles = 144 maps. Each map tile is 128×128 = 16,384 bytes of color data.
+
+  Per frame per player:
+  144 tiles × 16,384 bytes = 2,359,296 bytes ≈ 2.25 MB
+
+  At 20fps:
+  2.25 MB × 20 = 45 MB/s ≈ 360 Mbps per player
+
+  On 1 Gbps:
+  1,000 Mbps ÷ 360 Mbps = ~2 players
+
+  The dirty-region optimization barely helps for typical video — even if 70% of pixels in a tile change, the bounding box still
+  covers most of the tile. It only saves meaningfully for content with static zones (letterbox bars, static backgrounds, talking
+  heads).
+
+  For slow/static content where ~70% of tiles are fully unchanged:
+  0.30 × 360 Mbps = 108 Mbps per player → ~9 players on 1 Gbps
+
+  ---
+  Improvements, ranked by impact
+
+  1. Reduce fps — highest impact, trivial to implement
+
+  The fps=20 in ffmpeg is the entire frame budget. Halving it halves bandwidth:
+
+  ┌─────┬─────────────────┬─────────────────┬───────────────────┐
+  │ fps │ MB/s per player │ Mbps per player │ Players on 1 Gbps │
+  ├─────┼─────────────────┼─────────────────┼───────────────────┤
+  │ 20  │ 45              │ 360             │ 2                 │
+  ├─────┼─────────────────┼─────────────────┼───────────────────┤
+  │ 15  │ 33.75           │ 270             │ 3                 │
+  ├─────┼─────────────────┼─────────────────┼───────────────────┤
+  │ 10  │ 22.5            │ 180             │ 5                 │
+  ├─────┼─────────────────┼─────────────────┼───────────────────┤
+  │ 5   │ 11.25           │ 90              │ 11                │
+  └─────┴─────────────────┴─────────────────┴───────────────────┘
+
+  Maps at 10fps are still very watchable. Add it to config.yml:
+  video-fps: 10
+  Then pass it into the ffmpeg fps= filter and the Minecraft scheduler period.
+
+  ---
+  2. Player facing filter — large saving in a theater setting
+
+  Most players in a theater are facing the screen. Players behind the screen or facing away don't need packets. A dot-product check
+  against the screen's normal vector filters them:
+
+  // For a NORTH-facing screen, normal points south (+Z). Skip players whose yaw
+  // has them looking >90° away from the screen.
+  float yaw = (float) Math.toRadians(p.getLocation().getYaw());
+  float dotX = (float) -Math.sin(yaw); // player forward X
+  float dotZ = (float)  Math.cos(yaw); // player forward Z
+  // face.getModX/Z gives the screen's outward normal
+  if (dotX * face.getModX() + dotZ * face.getModZ() < -0.1f) continue; // facing away
+
+  In a typical cinema with players seated in front, this eliminates 0 extra overhead and could save 20-50% of total bandwidth from
+  players wandering behind the screen.
+
+  ---
+  3. Multi-strip patches per tile — good for content with static bands
+
+  Right now you send one bounding-box packet per tile per frame. If a tile has changes in rows 0–10 and 100–127 but rows 11–99 are
+  static, you send all 128 rows. Splitting into horizontal strips (e.g. 16-pixel tall) and sending only changed strips:
+
+  - Strip size of 16 rows → 8 strips per tile
+  - For a tile where 2 of 8 strips changed: send 2×128×16 = 4,096 bytes instead of 16,384 → 75% saving for that tile
+  - For a tile where all 8 strips changed: same as now + 8× packet overhead (negligible)
+
+  This is particularly powerful for letterboxed 16:9 content on a non-16:9 screen, or content with static UI overlays.
+
+  ---
+  4. Distance-based fps scaling — free player count scaling
+
+  Players at 60 blocks can't read fine detail at the same rate as players at 10 blocks. Track per-player last-sent tick and throttle
+  by distance:
+
+  double distSq = dx*dx + dy*dy + dz*dz;
+  int sendEvery = distSq < 20*20 ? 1 : distSq < 40*40 ? 2 : 4; // full/half/quarter fps
+  if ((frameIndex % sendEvery) != 0) continue;
+
+  A player at 60 blocks gets ¼ the packets → 90 Mbps per distant player. Essentially free to implement.
+
+  ---
+  5. Reduce render range — cheapest knob
+
+  The current range of 80 blocks is large. For a 16×9 map screen, players can't realistically read it from more than 30-40 blocks.
+  Drop getNearbyPlayersAsync(80) to getNearbyPlayersAsync(40). Not bandwidth per player, but limits the player count that can ever
+  watch simultaneously.
+
+  ---
+  Realistic numbers combining improvements
+
+  With 10fps + facing filter + 40-block range on typical video:
+
+  22.5 MB/s per player × (say) 0.8 facing factor = 18 MB/s ≈ 144 Mbps per player
+  → ~7 players on 1 Gbps
+
+  With 5fps + all optimizations on slow-paced/static content:
+  ~9–15 players on 1 Gbps
+
+  The fundamental ceiling is the Minecraft map protocol — 1 byte per pixel, no compression, no inter-frame encoding. A 16×9 map
+  screen is inherently a bandwidth-heavy feature. For a true cinema setup, 10fps with a 32-40 block viewing limit is the most
+  practical configuration.
+
+✻ Cooked for 1m 46s

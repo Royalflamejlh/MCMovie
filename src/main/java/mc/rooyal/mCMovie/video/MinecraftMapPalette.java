@@ -48,14 +48,15 @@ public final class MinecraftMapPalette {
         }
     }
 
-    // 64³ cache keyed by (r>>2, g>>2, b>>2). Separate filled array because byte 0 is valid.
-    private static final byte[]    COLOR_CACHE        = new byte[64 * 64 * 64];
-    private static final boolean[] COLOR_CACHE_FILLED = new boolean[64 * 64 * 64];
+    // 64³ cache keyed by (r>>2, g>>2, b>>2).
+    // 0 is the uninitialized sentinel — safe because matchColor never returns indices 0–3.
+    private static final byte[] COLOR_CACHE = new byte[64 * 64 * 64];
 
     /** Returns the palette index whose RGB is nearest to (r, g, b). Thread-safe after warm-up. */
     public static byte matchColor(int r, int g, int b) {
         int key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
-        if (COLOR_CACHE_FILLED[key]) return COLOR_CACHE[key];
+        byte cached = COLOR_CACHE[key];
+        if (cached != 0) return cached;
 
         byte best = 4;
         int  bestDist = Integer.MAX_VALUE;
@@ -67,8 +68,7 @@ public final class MinecraftMapPalette {
             int dist = dr * dr + dg * dg + db * db;
             if (dist < bestDist) { bestDist = dist; best = (byte) i; }
         }
-        COLOR_CACHE[key]        = best;
-        COLOR_CACHE_FILLED[key] = true;
+        COLOR_CACHE[key] = best;
         return best;
     }
 

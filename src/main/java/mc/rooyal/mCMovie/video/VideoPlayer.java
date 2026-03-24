@@ -14,8 +14,6 @@ import org.bukkit.Bukkit;
 import org.bukkit.Location;
 
 import java.io.*;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -141,7 +139,7 @@ public class VideoPlayer {
 
     /**
      * Called by the main-thread scheduler once per game tick.
-     * @return {@code true} if a new frame was consumed and maps should be sent
+     * @return {@code true} if a new frame was consumed and packets should be sent
      */
     public boolean advanceFrame() {
         if (!playbackReady) {
@@ -184,6 +182,9 @@ public class VideoPlayer {
         int hMaps      = screen.getHeightMaps();
         int tileCount  = wMaps * hMaps;
 
+        // Pre-allocated once; reused every frame. Only touched by the video thread.
+        final byte[] rawFrameBuffer = new byte[frameBytes];
+
         videoThread = new Thread(() -> {
             try {
                 String ffmpegBin = plugin.getBinaryManager().getFfmpegPath();
@@ -195,16 +196,16 @@ public class VideoPlayer {
                 cmd.add(ffmpegBin);
 
                 if (isHttpInput) {
-                    cmd.add("-fflags");       cmd.add("+nobuffer+discardcorrupt");
-                    cmd.add("-flags");        cmd.add("low_delay");
+                    cmd.add("-fflags");           cmd.add("+nobuffer+discardcorrupt");
+                    cmd.add("-flags");            cmd.add("low_delay");
                     cmd.add("-live_start_index"); cmd.add("-1");
                 } else {
                     cmd.add("-re");
                 }
 
-                cmd.add("-i"); cmd.add(input);
-                cmd.add("-vf"); cmd.add("scale=" + frameW + ":" + frameH + ",fps=20");
-                cmd.add("-f");        cmd.add("rawvideo");
+                cmd.add("-i");       cmd.add(input);
+                cmd.add("-vf");      cmd.add("scale=" + frameW + ":" + frameH + ",fps=20");
+                cmd.add("-f");       cmd.add("rawvideo");
                 cmd.add("-pix_fmt"); cmd.add("rgb24");
                 cmd.add("-an");
                 cmd.add("pipe:1");
@@ -221,8 +222,7 @@ public class VideoPlayer {
                 int frameCount = 0;
 
                 while (running) {
-                    byte[] raw = readExact(in, frameBytes);
-                    if (raw == null) {
+                    if (!readInto(in, rawFrameBuffer)) {
                         plugin.debug("Video EOF after " + frameCount
                                 + " frames, screen=" + screen.getId());
                         break;
@@ -235,14 +235,18 @@ public class VideoPlayer {
                     for (int row = 0; row < hMaps; row++) {
                         for (int col = 0; col < wMaps; col++) {
                             byte[] tileBytes = new byte[128 * 128];
+                            // Hoist the per-tile base offset out of both loops, then use a
+                            // running src index (src += 3) to eliminate two multiplications
+                            // from every iteration of the inner loop.
+                            int tileBase = (row * 128 * frameW + col * 128) * 3;
                             for (int py = 0; py < 128; py++) {
-                                for (int px = 0; px < 128; px++) {
-                                    int srcIdx = ((row * 128 + py) * frameW
-                                            + (col * 128 + px)) * 3;
-                                    tileBytes[py * 128 + px] = MinecraftMapPalette.matchColor(
-                                            raw[srcIdx]     & 0xFF,
-                                            raw[srcIdx + 1] & 0xFF,
-                                            raw[srcIdx + 2] & 0xFF);
+                                int src = tileBase + py * frameW * 3;
+                                int dst = py * 128;
+                                for (int px = 0; px < 128; px++, src += 3) {
+                                    tileBytes[dst + px] = MinecraftMapPalette.matchColor(
+                                            rawFrameBuffer[src]     & 0xFF,
+                                            rawFrameBuffer[src + 1] & 0xFF,
+                                            rawFrameBuffer[src + 2] & 0xFF);
                                 }
                             }
                             tiles[row * wMaps + col] = tileBytes;
@@ -320,6 +324,10 @@ public class VideoPlayer {
         final LinkedBlockingQueue<short[]> pcmQueue = new LinkedBlockingQueue<>(100);
         final short[] SILENCE = new short[AUDIO_CHUNK_SAMPLES]; // all zeros
 
+        // Pre-allocated raw PCM read buffer — reused every frame by the reader thread.
+        // Avoids allocating 1,920 bytes on every readInto() call (50×/second).
+        final byte[] rawAudioBuffer = new byte[AUDIO_CHUNK_BYTES];
+
         // Reader thread: pulls raw PCM from ffmpeg and fills pcmQueue.
         Thread readerThread = new Thread(() -> {
             String ffmpegBin = plugin.getBinaryManager().getFfmpegPath();
@@ -331,18 +339,18 @@ public class VideoPlayer {
             cmd.add(ffmpegBin);
 
             if (isHttpInput) {
-                cmd.add("-fflags");       cmd.add("+nobuffer+discardcorrupt");
-                cmd.add("-flags");        cmd.add("low_delay");
+                cmd.add("-fflags");           cmd.add("+nobuffer+discardcorrupt");
+                cmd.add("-flags");            cmd.add("low_delay");
                 cmd.add("-live_start_index"); cmd.add("-1");
-            } else {
-                cmd.add("-re");
             }
+            // No -re for local files: pcmQueue.put() below acts as the rate limiter,
+            // allowing faster initial buffer fill without frame drops.
 
-            cmd.add("-i"); cmd.add(input);
+            cmd.add("-i");  cmd.add(input);
             cmd.add("-vn");
-            cmd.add("-f");   cmd.add("s16le");
-            cmd.add("-ar");  cmd.add(String.valueOf(AUDIO_SAMPLE_RATE));
-            cmd.add("-ac");  cmd.add("1");
+            cmd.add("-f");  cmd.add("s16le");
+            cmd.add("-ar"); cmd.add(String.valueOf(AUDIO_SAMPLE_RATE));
+            cmd.add("-ac"); cmd.add("1");
             cmd.add("pipe:1");
             plugin.debug("Audio ffmpeg cmd: " + String.join(" ", cmd));
 
@@ -356,8 +364,7 @@ public class VideoPlayer {
                 InputStream in = audioProcess.getInputStream();
                 long frameCount = 0;
                 while (running) {
-                    byte[] raw = readExact(in, AUDIO_CHUNK_BYTES);
-                    if (raw == null) {
+                    if (!readInto(in, rawAudioBuffer)) {
                         plugin.debug("[MCMovie] Audio EOF after " + frameCount + " frames, screen=" + screen.getId());
                         break;
                     }
@@ -365,13 +372,30 @@ public class VideoPlayer {
                         plugin.getLogger().info("[MCMovie] First audio frame received, screen=" + screen.getId());
                     frameCount++;
 
+                    // Convert s16le bytes to shorts manually — avoids a ByteBuffer object
+                    // allocation on every frame (50 allocations/second eliminated).
                     short[] samples = new short[AUDIO_CHUNK_SAMPLES];
-                    ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
-                            .asShortBuffer().get(samples);
+                    for (int j = 0; j < AUDIO_CHUNK_SAMPLES; j++) {
+                        samples[j] = (short) ((rawAudioBuffer[j * 2] & 0xFF)
+                                | ((rawAudioBuffer[j * 2 + 1] & 0xFF) << 8));
+                    }
 
-                    if (!pcmQueue.offer(samples)) {
-                        plugin.debug("[MCMovie] Audio PCM queue full, dropping frame " + frameCount
-                                + " screen=" + screen.getId());
+                    if (isHttpInput) {
+                        // HTTP/HLS: never block — drop the frame if the queue is full.
+                        if (!pcmQueue.offer(samples)) {
+                            plugin.debug("[MCMovie] Audio PCM queue full, dropping frame " + frameCount
+                                    + " screen=" + screen.getId());
+                        }
+                    } else {
+                        // Local file: block until space is available.
+                        // With -re removed, ffmpeg produces as fast as possible; put() here
+                        // acts as the rate limiter so no audio frames are ever dropped.
+                        try {
+                            pcmQueue.put(samples);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
                     }
                 }
             } catch (IOException e) {
@@ -401,6 +425,7 @@ public class VideoPlayer {
 
                     byte[] opusFrame = encoder.encode(samples);
                     channel.send(opusFrame);
+                    channel.flush();
                     frameIndex++;
 
                     // Drift-correcting sleep: maintains exactly 20ms cadence
@@ -427,16 +452,18 @@ public class VideoPlayer {
         audioThread.start();
     }
 
-    /** Reads exactly {@code n} bytes. Returns {@code null} on EOF. */
-    private byte[] readExact(InputStream in, int n) throws IOException {
-        byte[] buf = new byte[n];
-        int off = 0;
+    /**
+     * Reads exactly {@code buf.length} bytes into {@code buf}, reusing the caller's
+     * buffer instead of allocating a new one. Returns {@code false} on EOF.
+     */
+    private boolean readInto(InputStream in, byte[] buf) throws IOException {
+        int off = 0, n = buf.length;
         while (off < n) {
             int r = in.read(buf, off, n - off);
-            if (r == -1) return null;
+            if (r == -1) return false;
             off += r;
         }
-        return buf;
+        return true;
     }
 
     public boolean isRunning() { return running; }
