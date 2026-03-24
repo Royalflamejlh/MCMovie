@@ -1,0 +1,14 @@
+name: MCMovie
+version: '0.0.1'
+main: mc.rooyal.mCMovie.MCMovie
+api-version: '1.21'
+softdepend: [voicechat]
+commands:
+  mcmovie:
+    description: MCMovie main command
+    usage: /<command> <screen create|play|stop|status|screen delete|screen list> [args]
+    permission: mcmovie.use
+permissions:
+  mcmovie.use:
+    description: Allows use of MCMovie commands
+    default: op
