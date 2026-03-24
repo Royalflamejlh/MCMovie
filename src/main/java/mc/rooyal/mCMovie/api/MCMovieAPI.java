@@ -74,6 +74,17 @@ public class MCMovieAPI {
     }
 
     /**
+     * Check whether a screen is currently playing.
+     *
+     * @param screenId the screen ID
+     * @return true if the screen exists and is playing
+     */
+    public static boolean isPlaying(String screenId) {
+        Screen screen = getScreen(screenId);
+        return screen != null && screen.isPlaying();
+    }
+
+    /**
      * Get all registered screens (unmodifiable).
      *
      * @return collection of all screens

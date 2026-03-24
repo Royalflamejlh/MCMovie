@@ -309,7 +309,7 @@ public class VideoPlayer {
             return;
         }
 
-        audioChannel.setDistance(32f);
+        audioChannel.setDistance((float) plugin.getConfig().getDouble("audio-distance", 32.0));
         plugin.getLogger().info("[MCMovie] Audio channel created id=" + audioChannel.getId() + " screen=" + screen.getId());
 
         // Capture local references for the threads — stop() may null the fields

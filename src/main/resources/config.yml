@@ -1,2 +1,5 @@
 # MCMovie configuration
 debug: false
+
+# Radius (in blocks) in which players can hear screen audio via SimpleVoiceChat.
+audio-distance: 32
