@@ -78,7 +78,11 @@ public final class MCMovie extends JavaPlugin {
                 if (service != null) {
                     service.registerPlugin(new MCMovieVoicechatPlugin());
                     voiceChatEnabled = true;
-                    getLogger().info("[MCMovie] SimpleVoiceChat integration registered.");
+                    if (voicechatServerApi != null) {
+                        getLogger().info("[MCMovie] SimpleVoiceChat integration registered and server API acquired immediately.");
+                    } else {
+                        getLogger().warning("[MCMovie] SimpleVoiceChat integration registered but server API is still null — initialize() may not have been called. Audio will not work until VoicechatServerStartedEvent fires.");
+                    }
                 } else {
                     getLogger().warning("[MCMovie] SimpleVoiceChat plugin found but service not available.");
                 }

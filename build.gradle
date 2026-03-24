@@ -1,6 +1,7 @@
 plugins {
     id 'java'
     id("xyz.jpenilla.run-paper") version "2.3.1"
+    id 'maven-publish'
 }
 
 group = 'mc.rooyal'
@@ -55,6 +56,31 @@ processResources {
     filteringCharset 'UTF-8'
     filesMatching('plugin.yml') {
         expand props
+    }
+}
+
+publishing {
+    publications {
+        gpr(MavenPublication) {
+            artifact(tasks.jar) {
+                builtBy(tasks.jar)
+            }
+            groupId = project.group
+            artifactId = 'mcmovie'
+            version = project.version
+        }
+    }
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            def repo = System.getenv("GITHUB_REPOSITORY")
+            def repoUrl = repo != null ? "https://maven.pkg.github.com/${repo}" : "https://maven.pkg.github.com/OWNER/REPO"
+            url = uri(repoUrl)
+            credentials {
+                username = System.getenv("GITHUB_ACTOR")
+                password = System.getenv("GITHUB_TOKEN")
+            }
+        }
     }
 }
 

@@ -1,8 +1,9 @@
 package mc.rooyal.mCMovie.video;
 
 import de.maxhenkel.voicechat.api.VoicechatServerApi;
-import de.maxhenkel.voicechat.api.audiochannel.AudioPlayer;
 import de.maxhenkel.voicechat.api.audiochannel.LocationalAudioChannel;
+import de.maxhenkel.voicechat.api.opus.OpusEncoder;
+import de.maxhenkel.voicechat.api.opus.OpusEncoderMode;
 import mc.rooyal.mCMovie.MCMovie;
 import mc.rooyal.mCMovie.event.ScreenVideoChangeEvent;
 import mc.rooyal.mCMovie.event.ScreenVideoEndEvent;
@@ -16,37 +17,31 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 
 public class VideoPlayer {
 
-    private static final int AUDIO_SAMPLE_RATE  = 48000;
+    private static final int AUDIO_SAMPLE_RATE   = 48000;
     private static final int AUDIO_CHUNK_SAMPLES = 960;   // 20ms @ 48kHz mono
     private static final int AUDIO_CHUNK_BYTES   = AUDIO_CHUNK_SAMPLES * 2;
-    private static final int AUDIO_QUEUE_CAPACITY = 40;
+    private static final long AUDIO_FRAME_NS     = 20_000_000L; // 20ms in nanoseconds
 
     /**
      * How many pre-converted frames to buffer between the video thread and the
-     * game-tick scheduler. Large enough to absorb a full HLS segment burst
-     * (typically 2-4 s × 20 fps = 40-80 frames) so the game tick scheduler can
-     * drain them smoothly at exactly one frame per tick.
+     * game-tick scheduler.
      */
     private static final int FRAME_QUEUE_CAPACITY = 120;
 
     /**
      * Pre-roll for HTTP/HLS streams: buffer this many frames before starting.
-     * 60 frames = 3 s at 20 fps — enough to absorb a 2-3 s HLS segment gap.
      */
     private static final int BUFFER_THRESHOLD_HTTP = 60;
 
     /**
-     * Pre-roll for local files: minimal — just enough to let the palette cache
-     * warm up. The pipe is rate-limited with {@code -re} so no burst buffering needed.
+     * Pre-roll for local files: minimal.
      */
     private static final int BUFFER_THRESHOLD_LOCAL = 4;
 
@@ -60,8 +55,6 @@ public class VideoPlayer {
 
     private volatile boolean running = false;
 
-    // Pre-roll gating: advanceFrame() does nothing until enough frames are queued
-    // (or the timeout fires), preventing choppy startup on HLS streams.
     private volatile boolean playbackReady   = false;
     private volatile long    bufferStartMs   = 0;
     private volatile int     bufferThreshold = BUFFER_THRESHOLD_HTTP;
@@ -72,16 +65,10 @@ public class VideoPlayer {
     private Thread videoThread = null;
     private Thread audioThread = null;
 
-    // Video frames pre-converted to Minecraft map-palette bytes.
-    // Each element is one complete frame: byte[tileCount][128*128].
-    // The video thread produces; the game-tick scheduler consumes (advanceFrame).
     private final LinkedBlockingQueue<byte[][]> frameQueue =
             new LinkedBlockingQueue<>(FRAME_QUEUE_CAPACITY);
 
-    private final LinkedBlockingQueue<short[]> audioQueue =
-            new LinkedBlockingQueue<>(AUDIO_QUEUE_CAPACITY);
-
-    private AudioPlayer audioPlayer = null;
+    // Audio channel — set before audio thread starts, cleared in stop()
     private LocationalAudioChannel audioChannel = null;
 
     public VideoPlayer(Screen screen, MCMovie plugin) {
@@ -125,11 +112,12 @@ public class VideoPlayer {
     public void stop() {
         running = false;
 
-        if (audioPlayer != null) {
-            try { audioPlayer.stopPlaying(); } catch (Exception ignored) {}
-            audioPlayer = null;
+        // Flush and null the audio channel — the audio thread's finally block
+        // will also try to flush via its local reference, which is harmless.
+        if (audioChannel != null) {
+            try { audioChannel.flush(); } catch (Exception ignored) {}
+            audioChannel = null;
         }
-        audioChannel = null;
 
         destroyProcess(videoProcess);
         destroyProcess(audioProcess);
@@ -142,7 +130,6 @@ public class VideoPlayer {
         audioThread = null;
 
         frameQueue.clear();
-        audioQueue.clear();
         playbackReady   = false;
         bufferStartMs   = 0;
         bufferThreshold = BUFFER_THRESHOLD_HTTP;
@@ -154,15 +141,6 @@ public class VideoPlayer {
 
     /**
      * Called by the main-thread scheduler once per game tick.
-     *
-     * <p>During the pre-roll phase this returns {@code false} and does nothing,
-     * so the caller skips {@code sendMap()} entirely — zero packet overhead while
-     * buffering.  Once the gate opens it pops one frame per tick, updates all tile
-     * renderers atomically, and returns {@code true} so the caller knows to push
-     * the updated canvas to players.  When the queue is temporarily empty (HLS
-     * segment gap) it holds the last frame and returns {@code false}, which again
-     * suppresses all {@code sendMap()} calls — no wasted packets during stalls.
-     *
      * @return {@code true} if a new frame was consumed and maps should be sent
      */
     public boolean advanceFrame() {
@@ -171,7 +149,7 @@ public class VideoPlayer {
 
             int queued = frameQueue.size();
             boolean timedOut = System.currentTimeMillis() - bufferStartMs > BUFFER_TIMEOUT_MS;
-            if (queued < bufferThreshold && !timedOut) return false; // still pre-rolling
+            if (queued < bufferThreshold && !timedOut) return false;
 
             playbackReady = true;
             plugin.getLogger().info("[MCMovie] Buffered " + queued + " frames"
@@ -179,7 +157,7 @@ public class VideoPlayer {
         }
 
         byte[][] frame = frameQueue.poll();
-        if (frame == null) return false; // queue empty (HLS gap) — hold last frame, skip sendMap
+        if (frame == null) return false;
 
         List<MCMovieMapRenderer> renderers = screen.getRenderers();
         for (int i = 0; i < frame.length && i < renderers.size(); i++) {
@@ -212,14 +190,10 @@ public class VideoPlayer {
                 cmd.add(plugin.getBinaryManager().getFfmpegPath());
 
                 if (isHttpInput) {
-                    // Live HLS/HTTP stream: start at the live edge, minimise internal
-                    // buffering so frames reach us with the lowest possible latency.
                     cmd.add("-fflags");       cmd.add("+nobuffer+discardcorrupt");
                     cmd.add("-flags");        cmd.add("low_delay");
-                    cmd.add("-live_start_index"); cmd.add("-1"); // newest segment only
+                    cmd.add("-live_start_index"); cmd.add("-1");
                 } else {
-                    // Local file: pace output to real-time so we don't flood the pipe
-                    // and blow up the queue with thousands of pre-converted frames.
                     cmd.add("-re");
                 }
 
@@ -249,11 +223,9 @@ public class VideoPlayer {
                         break;
                     }
                     if (frameCount == 0)
-                        plugin.debug("First frame received, screen=" + screen.getId());
+                        plugin.debug("First video frame received, screen=" + screen.getId());
                     frameCount++;
 
-                    // Convert all tiles using the cached palette matcher (no BufferedImage,
-                    // no per-frame color-matching overhead once the cache is warm).
                     byte[][] tiles = new byte[tileCount][];
                     for (int row = 0; row < hMaps; row++) {
                         for (int col = 0; col < wMaps; col++) {
@@ -272,7 +244,6 @@ public class VideoPlayer {
                         }
                     }
 
-                    // Offer to queue; drop the frame if the queue is full rather than blocking.
                     if (!frameQueue.offer(tiles)) {
                         plugin.debug("Frame queue full, dropping frame " + frameCount
                                 + " for screen=" + screen.getId());
@@ -296,78 +267,140 @@ public class VideoPlayer {
     }
 
     private void startAudioThread(String input, boolean isHttpInput) {
-        if (!plugin.isVoiceChatEnabled()) return;
-
-        VoicechatServerApi api = plugin.getVoicechatServerApi();
-        if (api == null) return;
-
-        Location center = screen.getCenter();
-        try {
-            audioChannel = api.createLocationalAudioChannel(
-                    UUID.randomUUID(),
-                    api.fromServerLevel(center.getWorld()),
-                    api.createPosition(center.getX(), center.getY(), center.getZ())
-            );
-            audioChannel.setDistance(32f);
-
-            audioPlayer = api.createAudioPlayer(audioChannel, api.createEncoder(), () -> {
-                if (!running) return null;
-                try {
-                    return audioQueue.poll(100, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return null;
-                }
-            });
-            audioPlayer.startPlaying();
-        } catch (Exception e) {
-            plugin.getLogger().log(Level.WARNING,
-                    "[MCMovie] Failed to create audio channel", e);
+        if (!plugin.isVoiceChatEnabled()) {
+            plugin.getLogger().info("[MCMovie] Audio skipped: SimpleVoiceChat not enabled, screen=" + screen.getId());
             return;
         }
 
-        audioThread = new Thread(() -> {
+        VoicechatServerApi api = plugin.getVoicechatServerApi();
+        if (api == null) {
+            plugin.getLogger().warning("[MCMovie] Audio skipped: voicechatServerApi is null (server started event not fired?), screen=" + screen.getId());
+            return;
+        }
+
+        Location center = screen.getCenter();
+        plugin.debug("[MCMovie] Creating audio channel at " + center.toVector() + " screen=" + screen.getId());
+
+        audioChannel = api.createLocationalAudioChannel(
+                UUID.randomUUID(),
+                api.fromServerLevel(center.getWorld()),
+                api.createPosition(center.getX(), center.getY(), center.getZ())
+        );
+
+        if (audioChannel == null) {
+            plugin.getLogger().warning("[MCMovie] createLocationalAudioChannel returned null — voicechat server not ready? screen=" + screen.getId());
+            return;
+        }
+
+        audioChannel.setDistance(32f);
+        plugin.getLogger().info("[MCMovie] Audio channel created id=" + audioChannel.getId() + " screen=" + screen.getId());
+
+        // Capture local references for the threads — stop() may null the fields
+        final LocationalAudioChannel channel = audioChannel;
+
+        // PCM queue between the ffmpeg reader and the timed sender.
+        // ~100 frames = 2 s of buffer, enough to absorb HLS segment fetch gaps.
+        final LinkedBlockingQueue<short[]> pcmQueue = new LinkedBlockingQueue<>(100);
+        final short[] SILENCE = new short[AUDIO_CHUNK_SAMPLES]; // all zeros
+
+        // Reader thread: pulls raw PCM from ffmpeg and fills pcmQueue.
+        Thread readerThread = new Thread(() -> {
+            List<String> cmd = new ArrayList<>();
+            cmd.add(plugin.getBinaryManager().getFfmpegPath());
+
+            if (isHttpInput) {
+                cmd.add("-fflags");       cmd.add("+nobuffer+discardcorrupt");
+                cmd.add("-flags");        cmd.add("low_delay");
+                cmd.add("-live_start_index"); cmd.add("-1");
+            } else {
+                cmd.add("-re");
+            }
+
+            cmd.add("-i"); cmd.add(input);
+            cmd.add("-vn");
+            cmd.add("-f");   cmd.add("s16le");
+            cmd.add("-ar");  cmd.add(String.valueOf(AUDIO_SAMPLE_RATE));
+            cmd.add("-ac");  cmd.add("1");
+            cmd.add("pipe:1");
+            plugin.debug("Audio ffmpeg cmd: " + String.join(" ", cmd));
+
             try {
-                List<String> cmd = new ArrayList<>();
-                cmd.add(plugin.getBinaryManager().getFfmpegPath());
-
-                if (isHttpInput) {
-                    cmd.add("-fflags");       cmd.add("+nobuffer+discardcorrupt");
-                    cmd.add("-flags");        cmd.add("low_delay");
-                    cmd.add("-live_start_index"); cmd.add("-1");
-                } else {
-                    cmd.add("-re");
-                }
-
-                cmd.add("-i"); cmd.add(input);
-                cmd.add("-vn");
-                cmd.add("-f");   cmd.add("s16le");
-                cmd.add("-ar");  cmd.add(String.valueOf(AUDIO_SAMPLE_RATE));
-                cmd.add("-ac");  cmd.add("1");
-                cmd.add("pipe:1");
-                plugin.debug("Audio ffmpeg cmd: " + String.join(" ", cmd));
-
                 ProcessBuilder pb = new ProcessBuilder(cmd);
                 pb.redirectErrorStream(false);
                 audioProcess = pb.start();
-                plugin.debug("Audio ffmpeg PID=" + audioProcess.pid()
+                plugin.getLogger().info("[MCMovie] Audio ffmpeg PID=" + audioProcess.pid()
                         + " screen=" + screen.getId());
 
                 InputStream in = audioProcess.getInputStream();
+                long frameCount = 0;
                 while (running) {
                     byte[] raw = readExact(in, AUDIO_CHUNK_BYTES);
-                    if (raw == null) break;
+                    if (raw == null) {
+                        plugin.debug("[MCMovie] Audio EOF after " + frameCount + " frames, screen=" + screen.getId());
+                        break;
+                    }
+                    if (frameCount == 0)
+                        plugin.getLogger().info("[MCMovie] First audio frame received, screen=" + screen.getId());
+                    frameCount++;
+
                     short[] samples = new short[AUDIO_CHUNK_SAMPLES];
                     ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
                             .asShortBuffer().get(samples);
-                    audioQueue.offer(samples);
+
+                    if (!pcmQueue.offer(samples)) {
+                        plugin.debug("[MCMovie] Audio PCM queue full, dropping frame " + frameCount
+                                + " screen=" + screen.getId());
+                    }
                 }
             } catch (IOException e) {
                 if (running)
                     plugin.getLogger().log(Level.WARNING,
-                            "[MCMovie] Audio thread error, screen=" + screen.getId(), e);
+                            "[MCMovie] Audio reader error, screen=" + screen.getId(), e);
             }
-        }, "MCMovie-Audio-" + screen.getId());
+        }, "MCMovie-AudioReader-" + screen.getId());
+        readerThread.setDaemon(true);
+
+        // Sender thread: encodes PCM and sends one Opus frame every 20 ms.
+        // Sends silence when the queue is empty (HLS segment gap) instead of stalling.
+        audioThread = new Thread(() -> {
+            OpusEncoder encoder = api.createEncoder(OpusEncoderMode.AUDIO);
+            plugin.debug("[MCMovie] OpusEncoder created, screen=" + screen.getId());
+            readerThread.start();
+
+            long startTime = System.nanoTime();
+            long frameIndex = 0;
+
+            try {
+                while (running) {
+                    short[] samples = pcmQueue.poll(); // non-blocking — null on empty
+                    if (samples == null) {
+                        samples = SILENCE; // fill gap with silence instead of skipping
+                    }
+
+                    byte[] opusFrame = encoder.encode(samples);
+                    channel.send(opusFrame);
+                    frameIndex++;
+
+                    // Drift-correcting sleep: maintains exactly 20ms cadence
+                    long targetNs = startTime + frameIndex * AUDIO_FRAME_NS;
+                    long waitNs = targetNs - System.nanoTime();
+                    if (waitNs > 0) {
+                        try {
+                            Thread.sleep(waitNs / 1_000_000L, (int)(waitNs % 1_000_000L));
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+            } finally {
+                readerThread.interrupt();
+                plugin.debug("[MCMovie] Audio sender ending after " + frameIndex + " frames, screen=" + screen.getId());
+                try { channel.flush(); } catch (Exception ignored) {}
+                try { encoder.close(); } catch (Exception ignored) {}
+                plugin.debug("[MCMovie] Audio sender done, screen=" + screen.getId());
+            }
+        }, "MCMovie-AudioSender-" + screen.getId());
         audioThread.setDaemon(true);
         audioThread.start();
     }
