@@ -1,5 +1,5 @@
 name: MCMovie
-version: '0.0.1'
+version: '0.0.2'
 main: mc.rooyal.mCMovie.MCMovie
 api-version: '1.21'
 softdepend: [voicechat]

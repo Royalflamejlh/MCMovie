@@ -186,8 +186,13 @@ public class VideoPlayer {
 
         videoThread = new Thread(() -> {
             try {
+                String ffmpegBin = plugin.getBinaryManager().getFfmpegPath();
+                if (ffmpegBin == null) {
+                    plugin.getLogger().severe("[MCMovie] ffmpeg is not available — video will not play. Check server logs for installation instructions.");
+                    return;
+                }
                 List<String> cmd = new ArrayList<>();
-                cmd.add(plugin.getBinaryManager().getFfmpegPath());
+                cmd.add(ffmpegBin);
 
                 if (isHttpInput) {
                     cmd.add("-fflags");       cmd.add("+nobuffer+discardcorrupt");
@@ -244,9 +249,21 @@ public class VideoPlayer {
                         }
                     }
 
-                    if (!frameQueue.offer(tiles)) {
-                        plugin.debug("Frame queue full, dropping frame " + frameCount
-                                + " for screen=" + screen.getId());
+                    if (isHttpInput) {
+                        // HLS: drop frame if queue is full — never block on a live stream
+                        if (!frameQueue.offer(tiles)) {
+                            plugin.debug("Frame queue full, dropping frame " + frameCount
+                                    + " for screen=" + screen.getId());
+                        }
+                    } else {
+                        // Local file: block until space is available.
+                        // This is the rate limiter — naturally caps the producer to the 20fps consumer.
+                        try {
+                            frameQueue.put(tiles);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
                     }
                 }
             } catch (IOException e) {
@@ -305,8 +322,13 @@ public class VideoPlayer {
 
         // Reader thread: pulls raw PCM from ffmpeg and fills pcmQueue.
         Thread readerThread = new Thread(() -> {
+            String ffmpegBin = plugin.getBinaryManager().getFfmpegPath();
+            if (ffmpegBin == null) {
+                plugin.getLogger().severe("[MCMovie] ffmpeg is not available — audio will not play. Check server logs for installation instructions.");
+                return;
+            }
             List<String> cmd = new ArrayList<>();
-            cmd.add(plugin.getBinaryManager().getFfmpegPath());
+            cmd.add(ffmpegBin);
 
             if (isHttpInput) {
                 cmd.add("-fflags");       cmd.add("+nobuffer+discardcorrupt");

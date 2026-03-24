@@ -5,11 +5,7 @@ plugins {
 }
 
 group = 'mc.rooyal'
-version = '0.0.1'
-
-// libs/ is both a flat-dir repo (for local .jar deps) and a resource root,
-// so libs/bin/ffmpeg and libs/bin/streamlink.tar.gz land in the JAR as /bin/*
-sourceSets.main.resources.srcDir 'libs'
+version = '0.0.2'
 
 repositories {
     flatDir { dirs 'libs' }

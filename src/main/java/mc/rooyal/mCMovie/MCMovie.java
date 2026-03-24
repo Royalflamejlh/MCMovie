@@ -67,9 +67,9 @@ public final class MCMovie extends JavaPlugin {
                     + (System.currentTimeMillis() - t) + " ms");
         });
 
-        // Extract bundled binaries synchronously (fast — just copies from JAR)
+        // Download/verify ffmpeg async (cached after first run)
         binaryManager = new BinaryManager(this);
-        binaryManager.extractBinaries();
+        binaryManager.setupAsync();
 
         // Register SimpleVoiceChat integration (soft depend)
         if (getServer().getPluginManager().getPlugin("voicechat") != null) {
