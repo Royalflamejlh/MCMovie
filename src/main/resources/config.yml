@@ -1,5 +1,14 @@
 # MCMovie configuration
 debug: false
 
+# Radius (in blocks) in which players receive map packets.
+# Lower = fewer players served = lower bandwidth. Recommended: 32-48.
+view-distance: 40
+
+# Playback frame rate sent to Minecraft clients.
+# Lower fps = proportionally lower bandwidth. 10fps is watchable; 20fps is max.
+# Supported values (must divide 20 evenly for best results): 20, 10, 5, 4, 2, 1
+video-fps: 10
+
 # Radius (in blocks) in which players can hear screen audio via SimpleVoiceChat.
 audio-distance: 32
