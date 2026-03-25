@@ -96,14 +96,20 @@ public final class MCMovie extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        // Stop all video players
         if (screenManager != null) {
             for (Screen screen : screenManager.getAllScreens().values()) {
+                // stop() joins threads and waits for ffmpeg to exit — must come first
                 if (screen.getVideoPlayer() != null) {
                     screen.getVideoPlayer().stop();
                 }
+                // Remove renderers so the old plugin class loader can be GC'd cleanly
+                for (int mapId : screen.getMapIds()) {
+                    org.bukkit.map.MapView mapView = Bukkit.getMap(mapId);
+                    if (mapView != null) {
+                        mapView.getRenderers().forEach(mapView::removeRenderer);
+                    }
+                }
             }
-            // Save screens
             screenManager.saveScreens(screensFile);
         }
 

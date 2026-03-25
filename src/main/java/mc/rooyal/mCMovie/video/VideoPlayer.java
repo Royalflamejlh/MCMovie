@@ -13,9 +13,12 @@ import mc.rooyal.mCMovie.event.ScreenVideoStartEvent;
 import mc.rooyal.mCMovie.screen.MCMovieMapRenderer;
 import mc.rooyal.mCMovie.screen.Screen;
 import org.bukkit.Bukkit;
+import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
 import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Player;
+import org.bukkit.util.RayTraceResult;
+import org.bukkit.util.Vector;
 
 import java.io.*;
 import java.io.BufferedReader;
@@ -28,6 +31,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 
 public class VideoPlayer {
@@ -105,15 +109,17 @@ public class VideoPlayer {
         videoProcess = null;
         audioProcess = null;
 
-        interruptThread(videoThread);
-        interruptThread(audioThread);
+        interruptAndJoin(videoThread);
+        interruptAndJoin(audioThread);
         videoThread = null;
         audioThread = null;
 
         frameCount = 0;
         screen.setPlaying(false);
-        Bukkit.getScheduler().runTask(plugin, () ->
-                Bukkit.getPluginManager().callEvent(new ScreenVideoEndEvent(screen)));
+        if (plugin.isEnabled()) {
+            Bukkit.getScheduler().runTask(plugin, () ->
+                    Bukkit.getPluginManager().callEvent(new ScreenVideoEndEvent(screen)));
+        }
     }
 
     public boolean isRunning() { return running; }
@@ -121,11 +127,15 @@ public class VideoPlayer {
     // ── Private helpers ────────────────────────────────────────────────────────
 
     private void destroyProcess(Process p) {
-        if (p != null && p.isAlive()) p.destroyForcibly();
+        if (p == null || !p.isAlive()) return;
+        p.destroyForcibly();
+        try { p.waitFor(5, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
-    private void interruptThread(Thread t) {
-        if (t != null && t.isAlive()) t.interrupt();
+    private void interruptAndJoin(Thread t) {
+        if (t == null || !t.isAlive()) return;
+        t.interrupt();
+        try { t.join(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
     /**
@@ -166,6 +176,22 @@ public class VideoPlayer {
             double distSq = dx * dx + dy * dy + dz * dz;
             int sendEvery = distSq < 20 * 20 ? 1 : distSq < 40 * 40 ? 2 : 4;
             if ((frameCount % sendEvery) != 0) continue;
+
+            // Line-of-sight: skip players with a solid block between them and the screen.
+            // Cast from the player's eye toward the screen centre; stop 0.5 blocks short
+            // so the wall the screen is mounted on doesn't count as an obstruction.
+            Location eye = p.getEyeLocation();
+            double toX = cx - eye.getX(), toY = cy - eye.getY(), toZ = cz - eye.getZ();
+            double eyeDist = Math.sqrt(toX * toX + toY * toY + toZ * toZ);
+            if (eyeDist > 1.0) {
+                double inv = 1.0 / eyeDist;
+                RayTraceResult hit = p.getWorld().rayTraceBlocks(
+                        eye,
+                        new Vector(toX * inv, toY * inv, toZ * inv),
+                        eyeDist - 0.5,
+                        FluidCollisionMode.NEVER);
+                if (hit != null) continue; // blocked by a solid block
+            }
 
             players.add(p);
         }
@@ -345,8 +371,10 @@ public class VideoPlayer {
                 if (running) {
                     running = false;
                     screen.setPlaying(false);
-                    Bukkit.getScheduler().runTask(plugin, () ->
-                            Bukkit.getPluginManager().callEvent(new ScreenVideoEndEvent(screen)));
+                    if (plugin.isEnabled()) {
+                        Bukkit.getScheduler().runTask(plugin, () ->
+                                Bukkit.getPluginManager().callEvent(new ScreenVideoEndEvent(screen)));
+                    }
                 }
             }
         }, "MCMovie-VideoDelivery-" + screen.getId());
