@@ -12,3 +12,8 @@ video-fps: 10
 
 # Radius (in blocks) in which players can hear screen audio via SimpleVoiceChat.
 audio-distance: 32
+
+# Ray-trace line-of-sight check before sending map packets.
+# When true, players with a solid block between them and the screen are skipped.
+# Disable if you see video disappearing when it shouldn't (e.g. glass walls, open-air setups).
+line-of-sight: true

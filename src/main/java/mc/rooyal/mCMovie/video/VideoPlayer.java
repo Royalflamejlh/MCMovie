@@ -178,19 +178,23 @@ public class VideoPlayer {
             if ((frameCount % sendEvery) != 0) continue;
 
             // Line-of-sight: skip players with a solid block between them and the screen.
-            // Cast from the player's eye toward the screen centre; stop 0.5 blocks short
-            // so the wall the screen is mounted on doesn't count as an obstruction.
-            Location eye = p.getEyeLocation();
-            double toX = cx - eye.getX(), toY = cy - eye.getY(), toZ = cz - eye.getZ();
-            double eyeDist = Math.sqrt(toX * toX + toY * toY + toZ * toZ);
-            if (eyeDist > 1.0) {
-                double inv = 1.0 / eyeDist;
-                RayTraceResult hit = p.getWorld().rayTraceBlocks(
-                        eye,
-                        new Vector(toX * inv, toY * inv, toZ * inv),
-                        eyeDist - 0.5,
-                        FluidCollisionMode.NEVER);
-                if (hit != null) continue; // blocked by a solid block
+            if (plugin.getConfig().getBoolean("line-of-sight", true)) {
+                try {
+                    Location eye = p.getEyeLocation();
+                    double toX = cx - eye.getX(), toY = cy - eye.getY(), toZ = cz - eye.getZ();
+                    double eyeDist = Math.sqrt(toX * toX + toY * toY + toZ * toZ);
+                    if (eyeDist > 1.0) {
+                        double inv = 1.0 / eyeDist;
+                        RayTraceResult hit = p.getWorld().rayTraceBlocks(
+                                eye,
+                                new Vector(toX * inv, toY * inv, toZ * inv),
+                                eyeDist - 1.0,
+                                FluidCollisionMode.NEVER);
+                        if (hit != null) continue;
+                    }
+                } catch (Exception ignored) {
+                    // Async raytrace failed — include this player rather than skipping
+                }
             }
 
             players.add(p);
@@ -345,7 +349,12 @@ public class VideoPlayer {
                     // Hold last frame between HLS segments so clients see a freeze-frame
                     // rather than a hard pause.
                     if (lastTiles != null) {
-                        deliverFrame(lastTiles);
+                        try {
+                            deliverFrame(lastTiles);
+                        } catch (Exception e) {
+                            plugin.getLogger().log(Level.WARNING,
+                                    "[MCMovie] Frame delivery error, screen=" + screen.getId(), e);
+                        }
                         if (!firstDelivered) {
                             firstDelivered = true;
                             firstFrameLatch.countDown(); // release audio sender

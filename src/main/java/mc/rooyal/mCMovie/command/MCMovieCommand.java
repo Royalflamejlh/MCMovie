@@ -46,6 +46,8 @@ public class MCMovieCommand implements CommandExecutor, TabCompleter {
                 return handleStop(sender, args);
             case "status":
                 return handleStatus(sender, args);
+            case "reload":
+                return handleReload(sender);
             default:
                 sendHelp(sender);
                 return true;
@@ -170,6 +172,25 @@ public class MCMovieCommand implements CommandExecutor, TabCompleter {
         return true;
     }
 
+    private boolean handleReload(CommandSender sender) {
+        // Stop all active playback so threads aren't left running with stale config values
+        for (Screen s : screenManager.getAllScreens().values()) {
+            if (s.getVideoPlayer() != null) {
+                s.getVideoPlayer().stop();
+                s.setVideoPlayer(null);
+            }
+        }
+
+        plugin.reloadConfig();
+
+        sender.sendMessage(Component.text("[MCMovie] Config reloaded. line-of-sight="
+                + plugin.getConfig().getBoolean("line-of-sight", true)
+                + " video-fps=" + plugin.getConfig().getInt("video-fps", 10)
+                + " view-distance=" + plugin.getConfig().getInt("view-distance", 40),
+                NamedTextColor.GREEN));
+        return true;
+    }
+
     private boolean handleStatus(CommandSender sender, String[] args) {
         Screen screen = findNearestScreenOrFirst(sender);
         if (screen == null) {
@@ -226,7 +247,7 @@ public class MCMovieCommand implements CommandExecutor, TabCompleter {
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (args.length == 1) {
-            return filterStart(args[0], Arrays.asList("screen", "play", "stop", "status"));
+            return filterStart(args[0], Arrays.asList("screen", "play", "stop", "status", "reload"));
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("screen")) {
             return filterStart(args[1], Arrays.asList("create", "delete", "list"));
@@ -251,5 +272,6 @@ public class MCMovieCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage(Component.text("  /mcmovie play <url|file>       - Play media on nearest screen", NamedTextColor.WHITE));
         sender.sendMessage(Component.text("  /mcmovie stop                  - Stop nearest screen", NamedTextColor.WHITE));
         sender.sendMessage(Component.text("  /mcmovie status                - Show status of nearest screen", NamedTextColor.WHITE));
+        sender.sendMessage(Component.text("  /mcmovie reload                - Reload config.yml", NamedTextColor.WHITE));
     }
 }

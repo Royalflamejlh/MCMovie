@@ -102,13 +102,10 @@ public final class MCMovie extends JavaPlugin {
                 if (screen.getVideoPlayer() != null) {
                     screen.getVideoPlayer().stop();
                 }
-                // Remove renderers so the old plugin class loader can be GC'd cleanly
-                for (int mapId : screen.getMapIds()) {
-                    org.bukkit.map.MapView mapView = Bukkit.getMap(mapId);
-                    if (mapView != null) {
-                        mapView.getRenderers().forEach(mapView::removeRenderer);
-                    }
-                }
+                // Note: renderers are intentionally left registered on their MapViews.
+                // Removing them here pushes blank map data to all clients, which corrupts
+                // their local cache. loadScreens() removes and replaces them on next enable,
+                // which is early enough. The brief class-loader reference is acceptable.
             }
             screenManager.saveScreens(screensFile);
         }

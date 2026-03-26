@@ -275,6 +275,11 @@ public class ScreenManager {
                         mapView.getRenderers().forEach(mapView::removeRenderer);
                         MCMovieMapRenderer renderer = new MCMovieMapRenderer();
                         mapView.addRenderer(renderer);
+                        // Force-resend the map to any online players whose client may have
+                        // cached blank data from a previous unclean disable/reload.
+                        for (org.bukkit.entity.Player p : Bukkit.getOnlinePlayers()) {
+                            p.sendMap(mapView);
+                        }
                         renderers.add(renderer);
                     } else {
                         renderers.add(new MCMovieMapRenderer());
